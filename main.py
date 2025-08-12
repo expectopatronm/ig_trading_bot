@@ -5,9 +5,11 @@
 # - Token refresh on 401
 # - Graceful shutdown closes open positions
 # - Per-trade TP ≈ €1, repeats until ≈ €10 daily target
+# - Smarter management: breakeven move + trailing stop, signal invalidation exit, volatility/spread gates
+
 import os
-import sys, time, json, signal, logging, threading
-from typing import Dict, Any, Optional, Tuple
+import sys, time, json, signal, logging, threading, math
+from typing import Dict, Any, Optional, Tuple, List
 
 import requests
 
@@ -19,12 +21,23 @@ logging.basicConfig(
 
 DEMO_BASE = "https://demo-api.ig.com/gateway/deal"
 
-# Strategy targets
+# ===== Strategy targets & risk =====
 PER_TRADE_TARGET_EUR = 1.0
 DAILY_TARGET_EUR = 10.0
-MAX_HOLD_SECONDS = 300  # close manually if TP not hit within 5 minutes
-STOP_TO_LIMIT_MULTIPLIER = 3.0  # SL distance = 3x TP distance (rounded & >= min stop)
+STOP_TO_LIMIT_MULTIPLIER = 3.0  # SL distance = 3x TP distance (>= IG min stop)
 
+# ===== Entry filters / management =====
+EMA_PERIOD = 20  # for signal invalidation (1-min EMA)
+ATR_PERIOD = 14  # ATR period in 1-min bars
+ATR_MIN_THRESHOLD = 3.0  # points require this ATR to enter exit if it collapses below
+SPREAD_MAX_POINTS = 3.0  # points skip entry if spread too wide exit if it spikes above
+BREAKEVEN_TRIGGER_RATIO = 0.5  # activate trailing when move >= 50% of TP distance
+BREAKEVEN_OFFSET_POINTS = 0.1  # tiny cushion past entry when moving stop to breakeven
+TRAIL_DIST_ATR_MULT = 0.8  # trailing stop distance = 0.8 x ATR (clamped by IG min stop)
+TRAIL_STEP_ATR_MULT = 0.3  # trailing increment step = 0.3 x ATR (>= MIN_TRAIL_STEP_POINTS)
+MIN_TRAIL_STEP_POINTS = 0.1  # floor for trailing increment step (points)
+
+# ===== Infra =====
 POLL_POSITIONS_SEC = 2.0
 RETRY_BACKOFF_SEC = 1.0
 
@@ -37,7 +50,7 @@ class IGRest:
     This client:
       - Manages authentication tokens (CST, X-SECURITY-TOKEN).
       - Automatically retries once on HTTP 401 using /session/refresh-token.
-      - Exposes helpers for markets, prices, and opening/closing positions.
+      - Exposes helpers for markets, prices, opening/closing positions, and updating stops.
 
     Attributes:
         api_key: Your IG API key.
@@ -71,17 +84,10 @@ class IGRest:
     # ----- low-level helpers -----
 
     def _headers(self, version: Optional[str] = None) -> Dict[str, str]:
-        """Build default request headers including API key, tokens, and optional VERSION.
-
-        Args:
-            version: Optional IG API VERSION header value required by some endpoints.
-
-        Returns:
-            A dict of HTTP headers appropriate for IG REST calls.
-        """
+        """Build default request headers including API key, tokens, and optional VERSION."""
         h = {
             "X-IG-API-KEY": self.api_key,
-            "Accept": "application/json; charset=UTF-8",
+            "Accept": "application/json charset=UTF-8",
             "Content-Type": "application/json",
         }
         if self.cst: h["CST"] = self.cst
@@ -92,25 +98,14 @@ class IGRest:
     def _request(self, method: str, url: str, version: Optional[str] = None, **kwargs) -> requests.Response:
         """Send an HTTP request with IG headers and refresh tokens once on 401.
 
-        If the first request returns 401, this method invokes /session/refresh-token
-        (VERSION 1) and retries the original request once.
-
-        Args:
-            method: HTTP method (e.g., "GET", "POST", "DELETE").
-            url: Fully qualified IG REST URL.
-            version: Optional IG API VERSION header.
-            **kwargs: Forwarded to requests.Session.request (e.g., json, data, timeout).
-
-        Returns:
-            The final requests.Response (may be non-2xx). No exceptions are raised here.
-        """
+        If the first request returns 401, invokes /session/refresh-token and retries once.
+        Returns the final Response (may be non-2xx)."""
         r = self.s.request(method, url, headers=self._headers(version), timeout=kwargs.pop("timeout", 20), **kwargs)
         if r.status_code == 401:
             try:
                 logging.warning("401 on %s %s | body=%s", method, url, r.text[:300])
             except Exception:
                 pass
-            # Refresh tokens then retry once
             rr = self.s.post(f"{DEMO_BASE}/session/refresh-token", headers=self._headers("1"), timeout=10)
             if rr.status_code in (200, 201):
                 self.cst = rr.headers.get("CST") or self.cst
@@ -121,20 +116,10 @@ class IGRest:
     # ----- session -----
 
     def login(self) -> None:
-        """Authenticate, store tokens, select default account, and resolve account type.
-
-        Performs:
-            - POST /session (VERSION 2) with identifier/password.
-            - Optional GET/PUT to select preferred account to avoid some 401s.
-            - GET /accounts to discover the active account type.
-
-        Raises:
-            RuntimeError: If authentication fails or tokens are missing.
-        """
-        # POST /session (VERSION 2/3). Returns session tokens (CST, X-SECURITY-TOKEN).
+        """Authenticate, store tokens, select default account, and resolve account type."""
         r = self.s.post(f"{DEMO_BASE}/session",
                         headers=self._headers("2"),
-                        data=json.dumps({"identifier": self.username, "password": self.password}),
+                        json={"identifier": self.username, "password": self.password},
                         timeout=20)
         if r.status_code not in (200, 201):
             raise RuntimeError(f"Login failed: HTTP {r.status_code} {r.text[:400]}")
@@ -155,7 +140,7 @@ class IGRest:
         if self.account_id:
             r2 = self.s.put(f"{DEMO_BASE}/session",
                             headers=self._headers("1"),
-                            data=json.dumps({"accountId": self.account_id, "defaultAccount": True}),
+                            json={"accountId": self.account_id, "defaultAccount": True},
                             timeout=10)
             if r2.status_code not in (200, 204):
                 logging.warning("Setting preferred account returned %s: %s", r2.status_code, r2.text[:200])
@@ -183,36 +168,14 @@ class IGRest:
     # ----- markets & prices -----
 
     def search_markets(self, term: str) -> Dict[str, Any]:
-        """Search for markets using a free-text term.
-
-        Args:
-            term: Case-insensitive search term (e.g., "dax", "germany 40").
-
-        Returns:
-            Parsed JSON response from GET /markets?searchTerm=...
-
-        Raises:
-            RuntimeError: If the HTTP response has status >= 400.
-        """
+        """Search for markets using a free-text term."""
         r = self._request("GET", f"{DEMO_BASE}/markets?searchTerm={requests.utils.quote(term)}", "1")
         if r.status_code >= 400:
             raise RuntimeError(f"search_markets failed: {r.status_code} {r.text[:400]}")
         return r.json()
 
     def market_details(self, epic: str) -> Dict[str, Any]:
-        """Retrieve detailed instrument metadata and snapshot for a market epic.
-
-        Tries VERSION 4, then falls back to VERSION 3 if needed.
-
-        Args:
-            epic: IG market epic (e.g., "IX.D.DAX.IFD.IP").
-
-        Returns:
-            Parsed JSON from GET /markets/{epic}.
-
-        Raises:
-            RuntimeError: If both attempts fail with HTTP status >= 400.
-        """
+        """Retrieve detailed instrument metadata and snapshot for a market epic."""
         r = self._request("GET", f"{DEMO_BASE}/markets/{epic}", "4")
         if r.status_code == 404:
             r = self._request("GET", f"{DEMO_BASE}/markets/{epic}", "3")
@@ -221,19 +184,7 @@ class IGRest:
         return r.json()
 
     def recent_prices(self, epic: str, resolution: str = "MINUTE", num_points: int = 3) -> Dict[str, Any]:
-        """Fetch a small window of recent prices for a market.
-
-        Args:
-            epic: IG market epic.
-            resolution: Candle resolution (e.g., 'MINUTE', 'HOUR').
-            num_points: Number of data points to request.
-
-        Returns:
-            Parsed JSON from GET /prices/{epic}/{resolution}/{num_points}.
-
-        Raises:
-            RuntimeError: If the HTTP response has status >= 400.
-        """
+        """Fetch a small window of recent prices for a market (candles)."""
         r = self._request("GET", f"{DEMO_BASE}/prices/{epic}/{resolution}/{num_points}", "2")
         if r.status_code >= 400:
             raise RuntimeError(f"recent_prices failed: {r.status_code} {r.text[:400]}")
@@ -254,26 +205,11 @@ class IGRest:
 
         Uses FILL_OR_KILL and forceOpen=True (except when netting off elsewhere).
         Expiry is '-' for CFD cash indices and 'DFB' for spread bets.
-
-        Args:
-            epic: Market epic to trade.
-            direction: 'BUY' or 'SELL'.
-            size: Deal size in instrument units (CONTRACTS or AMOUNT).
-            currency: Currency code for the order (e.g., 'EUR').
-            limit_distance_points: Take-profit distance in *points*.
-            stop_distance_points: Optional stop-loss distance in *points*.
-
-        Returns:
-            Tuple (deal_reference, confirmation_json) where confirmation_json is the
-            parsed result of GET /confirms/{dealReference}.
-
-        Raises:
-            RuntimeError: If the initial POST fails with non-2xx status.
         """
         expiry = "-" if (self.account_type or "CFD").upper() == "CFD" else "DFB"
         payload = {
             "epic": epic,
-            "expiry": expiry,  # CFD cash indices use "-" (undated); spreadbet uses "DFB"
+            "expiry": expiry,  # CFD cash indices use "-" (undated) spreadbet uses "DFB"
             "direction": direction.upper(),
             "size": float(size),
             "orderType": "MARKET",
@@ -286,39 +222,50 @@ class IGRest:
         if stop_distance_points and stop_distance_points > 0:
             payload["stopDistance"] = float(stop_distance_points)
 
-        r = self._request("POST", f"{DEMO_BASE}/positions/otc", "2", data=json.dumps(payload))
+        r = self._request("POST", f"{DEMO_BASE}/positions/otc", "2", json=payload)
         if r.status_code not in (200, 201):
             raise RuntimeError(f"Open position failed: HTTP {r.status_code} {r.text[:400]}")
         deal_ref = r.json().get("dealReference")
-
         confirm = self.deal_confirm(deal_ref)
         return deal_ref, confirm
 
+    def update_position(self, deal_id: str, *,
+                        limit_level: float | None = None,
+                        stop_level: float | None = None,
+                        trailing_stop: bool | None = None,
+                        trailing_stop_distance: float | None = None,
+                        trailing_stop_increment: float | None = None) -> str:
+        """Update an existing OTC position (e.g., set breakeven & trailing stop)."""
+        payload: Dict[str, Any] = {}
+        if limit_level is not None:
+            payload["limitLevel"] = float(limit_level)
+        if trailing_stop is not None:
+            payload["trailingStop"] = bool(trailing_stop)
+        if trailing_stop:
+            if trailing_stop_distance is None or trailing_stop_increment is None or stop_level is None:
+                raise ValueError("Trailing stop requires stop_level, trailing_stop_distance, trailing_stop_increment")
+            payload["trailingStopDistance"] = float(trailing_stop_distance)
+            payload["trailingStopIncrement"] = float(trailing_stop_increment)
+            payload["stopLevel"] = float(stop_level)
+        elif stop_level is not None:
+            payload["stopLevel"] = float(stop_level)
+
+        r = self._request("PUT", f"{DEMO_BASE}/positions/otc/{deal_id}", "2", json=payload)
+        if r.status_code not in (200, 201):
+            raise RuntimeError(f"Update position failed: HTTP {r.status_code} {r.text[:200]}")
+        try:
+            return r.json().get("dealReference", "")
+        except Exception:
+            return ""
+
     def deal_confirm(self, deal_reference: str) -> Dict[str, Any]:
-        """Retrieve a structured confirmation for a prior dealReference.
-
-        Args:
-            deal_reference: The dealReference returned by a dealing request.
-
-        Returns:
-            Parsed JSON from GET /confirms/{dealReference}.
-
-        Raises:
-            requests.HTTPError: If the response is not successful.
-        """
+        """Retrieve a structured confirmation for a prior dealReference."""
         r = self._request("GET", f"{DEMO_BASE}/confirms/{deal_reference}", "1")
         r.raise_for_status()
         return r.json()
 
     def list_positions(self) -> Dict[str, Any]:
-        """List all open positions on the active account.
-
-        Returns:
-            Parsed JSON from GET /positions (VERSION 2).
-
-        Raises:
-            requests.HTTPError: If the response is not successful.
-        """
+        """List all open positions on the active account."""
         r = self._request("GET", f"{DEMO_BASE}/positions", "2")
         r.raise_for_status()
         return r.json()
@@ -326,35 +273,34 @@ class IGRest:
     def close_position_market(self, deal_id: str, direction_open: str, size: float,
                               epic: str | None = None, expiry: str | None = None,
                               currency: str | None = None) -> str:
-        """Close an open position using the most reliable available method.
-
-        This performs three strategies in order:
-          1) DELETE /positions/otc with a JSON body (official).
-          2) POST /positions/otc with X-HTTP-Method-Override: DELETE (workaround).
-          3) Netting-off fallback: send opposite MARKET order with forceOpen=False.
-
-        Args:
-            deal_id: The dealId of the open position to close.
-            direction_open: The original open direction ('BUY' or 'SELL').
-            size: Size to close.
-            epic: Optional epic used for netting fallback.
-            expiry: Optional expiry used for netting fallback.
-            currency: Optional currency used for netting fallback.
-
-        Returns:
-            dealReference string from the successful close request (may be empty if
-            the endpoint returned 2xx without a body).
-
-        Raises:
-            RuntimeError: If all close strategies fail.
-        """
-        """
-        1) Try DELETE /positions/otc (official).
-        2) If body is ignored (e.g., Demo 400 validation.null-not-allowed.request), retry using
-           POST + X-HTTP-Method-Override: DELETE.
-        3) If still failing, "net off": send opposite MARKET order with forceOpen=False.
-        """
+        """Close an open position using the most reliable method (prefer net-off)."""
         opposite = "SELL" if (direction_open or "").upper() == "BUY" else "BUY"
+
+        # --- Prefer NET-OFF first if we know epic/currency ---
+        if epic and currency:
+            expiry = expiry or ("-" if (self.account_type or "CFD").upper() == "CFD" else "DFB")
+            rev = {
+                "epic": epic,
+                "expiry": expiry,
+                "direction": opposite,
+                "size": float(size),
+                "orderType": "MARKET",
+                "timeInForce": "FILL_OR_KILL",
+                "forceOpen": False,  # netting off closes exposure
+                "currencyCode": currency
+            }
+            r = self._request("POST", f"{DEMO_BASE}/positions/otc", "2", json=rev)
+            if r.status_code in (200, 201):
+                try:
+                    return r.json().get("dealReference", "")
+                except Exception:
+                    return ""
+            try:
+                logging.warning("Net-off failed %s: %s", r.status_code, r.json().get("errorCode"))
+            except Exception:
+                logging.warning("Net-off failed %s", r.status_code)
+
+        # --- Official DELETE with JSON body ---
         payload = {
             "dealId": deal_id,
             "direction": opposite,
@@ -362,8 +308,6 @@ class IGRest:
             "orderType": "MARKET",
             "timeInForce": "FILL_OR_KILL",
         }
-
-        # --- 1) Official DELETE ---
         r = self._request("DELETE", f"{DEMO_BASE}/positions/otc", "1", json=payload)
         if r.status_code in (200, 201):
             try:
@@ -371,107 +315,108 @@ class IGRest:
             except Exception:
                 return ""
 
-        # Parse errorCode if present
-        err_code = None
+        # --- Method-override POST as last resort ---
+        hdrs = self._headers("1")
+        hdrs["X-HTTP-Method-Override"] = "DELETE"
+        r2 = self.s.post(f"{DEMO_BASE}/positions/otc", headers=hdrs, json=payload, timeout=20)
+        if r2.status_code in (200, 201):
+            try:
+                return r2.json().get("dealReference", "")
+            except Exception:
+                return ""
+
+        # Bubble up the most informative error
+        err = None
         try:
-            err_code = r.json().get("errorCode")
+            err = r.json().get("errorCode")
         except Exception:
             pass
-        logging.warning("Close DELETE failed %s: %s", r.status_code, err_code or r.text[:200])
-
-        # --- 2) Method-override POST (community workaround) ---
-        if r.status_code == 400 and (err_code in ("validation.null-not-allowed.request", "invalid.input", None)):
-            hdrs = self._headers("1")
-            hdrs["X-HTTP-Method-Override"] = "DELETE"
-            r2 = self.s.post(f"{DEMO_BASE}/positions/otc", headers=hdrs, json=payload, timeout=20)
-            if r2.status_code in (200, 201):
-                try:
-                    return r2.json().get("dealReference", "")
-                except Exception:
-                    return ""
-            try:
-                logging.warning("Close POST override failed %s: %s", r2.status_code, r2.json().get("errorCode"))
-            except Exception:
-                logging.warning("Close POST override failed %s", r2.status_code)
-
-        # --- 3) Net-off fallback (opposite order, forceOpen=False) ---
-        if not epic:
-            # As a safeguard, try to read the position again to get epic/expiry/currency
-            try:
-                pos = self._request("GET", f"{DEMO_BASE}/positions/{deal_id}", "2")
-                if pos.status_code == 200:
-                    pdata = pos.json().get("position", {}) or {}
-                    epic = pdata.get("epic", epic)
-                    expiry = pdata.get("expiry", expiry)
-                    currency = pdata.get("currency", currency)
-            except Exception:
-                pass
-
-        if epic and currency:
-            rev = {
-                "epic": epic,
-                "expiry": expiry or "-",
-                "direction": opposite,
-                "size": float(size),
-                "orderType": "MARKET",
-                "timeInForce": "FILL_OR_KILL",
-                "forceOpen": False,  # critical for netting off
-                "guaranteedStop": False,
-                "currencyCode": currency,
-            }
-            r3 = self._request("POST", f"{DEMO_BASE}/positions/otc", "2", json=rev)
-            if r3.status_code in (200, 201):
-                try:
-                    return r3.json().get("dealReference", "")
-                except Exception:
-                    return ""
-            try:
-                logging.error("Net-off fallback failed %s: %s", r3.status_code, r3.json().get("errorCode"))
-            except Exception:
-                logging.error("Net-off fallback failed %s", r3.status_code)
-
-        raise RuntimeError(f"Close position failed: HTTP {r.status_code} {err_code or r.text[:200]}")
+        raise RuntimeError(f"Close position failed: HTTP {r.status_code} {err or r.text[:200]}")
 
 
-# ----- sizing & selection -----
+# ===== helpers: sizing / indicators =====
 
 def _points_per_pip(one_pip_means: str) -> float:
-    """Parse the instrument's 'onePipMeans' text and return points per pip.
-
-    Args:
-        one_pip_means: Free-text like '1 point' or '0.1 points'.
-
-    Returns:
-        Floating number of *points* represented by one pip. Defaults to 1.0 on
-        any parse error or empty input.
-    """
+    """Parse the instrument's 'onePipMeans' text and return points per pip."""
     if not one_pip_means:
         return 1.0
     try:
         return float(one_pip_means.strip().split()[0])
-    except Exception:
+    except Exception as e:
+        logging.info(f"Exception parsing onePipMeans '{one_pip_means}': {e}")
         return 1.0
+
+
+def ema(values: List[float], period: int) -> float:
+    """Compute EMA over a list (last value returned)."""
+    if not values:
+        return float("nan")
+    k = 2.0 / (period + 1.0)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1.0 - k)
+    return e
+
+
+def ema_of_closes(bars: List[Dict[str, Any]], period: int) -> float:
+    """EMA of mid-closes from IG price bars."""
+    closes = []
+    for b in bars:
+        cp = b.get("closePrice", {})
+        mid = cp.get("mid")
+        if mid is None:
+            bid = cp.get("bid")
+            ask = cp.get("ask")
+            if bid is not None and ask is not None:
+                mid = (bid + ask) / 2.0
+        if mid is not None:
+            closes.append(float(mid))
+    if len(closes) == 0:
+        return float("nan")
+    return ema(closes, period)
+
+
+def _bar_mid(x: Dict[str, Any], key: str) -> Optional[float]:
+    """Get mid of a price component (highPrice/lowPrice/closePrice)."""
+    d = x.get(key, {})
+    mid = d.get("mid")
+    if mid is None:
+        bid = d.get("bid")
+        ask = d.get("ask")
+        if bid is not None and ask is not None:
+            mid = (bid + ask) / 2.0
+    return float(mid) if mid is not None else None
+
+
+def compute_atr_points(bars: List[Dict[str, Any]], period: int = 14) -> float:
+    """Classic ATR in points using mid highs/lows and previous close."""
+    if len(bars) < period + 1:
+        return float("nan")
+    trs: List[float] = []
+    prev_close = _bar_mid(bars[0], "closePrice")
+    for b in bars[1:]:
+        high = _bar_mid(b, "highPrice")
+        low = _bar_mid(b, "lowPrice")
+        close = _bar_mid(b, "closePrice")
+        if high is None or low is None or prev_close is None:
+            prev_close = close
+            continue
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+        prev_close = close
+    if len(trs) < period:
+        return float("nan")
+    # Simple moving average of last `period` TRs
+    return sum(trs[-period:]) / float(period)
 
 
 def choose_germany40_epic(ig: IGRest) -> Tuple[str, Dict[str, Any]]:
     """Select a Germany 40 market epic that matches the account's unit type.
 
-    The function searches several common terms, filters to INDICES instruments
-    with the expected unit ('CONTRACTS' for CFD, 'AMOUNT' for spread bet), prefers
-    EUR-denominated and tradeable markets, and returns the candidate with the
-    smallest pip value (typically the mini contract).
-
-    Args:
-        ig: An authenticated IGRest client.
-
-    Returns:
-        Tuple (epic, details_json) for the chosen market.
-
-    Raises:
-        RuntimeError: If no suitable Germany 40 instrument is found.
-    """
+    Searches several terms, filters to INDICES with the expected unit
+    ('CONTRACTS' for CFD, 'AMOUNT' for spread bet), prefers EUR markets,
+    and returns the candidate with the smallest pip value (often the mini)."""
     want_unit = "CONTRACTS" if (ig.account_type or "CFD").upper() == "CFD" else "AMOUNT"
-    # Try a few common search terms
     markets = []
     for term in ("germany 40", "dax", "germany40"):
         try:
@@ -493,7 +438,6 @@ def choose_germany40_epic(ig: IGRest) -> Tuple[str, Dict[str, Any]]:
                 continue
             if instr.get("unit") != want_unit:
                 continue
-            # Prefer EUR & tradeable
             eur_ok = any(c.get("code") == "EUR" for c in instr.get("currencies", []))
             if not eur_ok:
                 continue
@@ -506,8 +450,7 @@ def choose_germany40_epic(ig: IGRest) -> Tuple[str, Dict[str, Any]]:
     if not candidates:
         raise RuntimeError(f"No Germany 40 market found for unit={want_unit} (account type {ig.account_type}).")
 
-    # Prefer the smallest pip value (often the mini contract)
-    candidates.sort(key=lambda x: x[1])
+    candidates.sort(key=lambda x: x[1])  # smallest pip value first
     epic, _, status, details = candidates[0]
     logging.info("Chosen EPIC %s (status=%s, unit=%s)", epic, status, details["instrument"]["unit"])
     return epic, details
@@ -515,25 +458,7 @@ def choose_germany40_epic(ig: IGRest) -> Tuple[str, Dict[str, Any]]:
 
 def compute_size_and_distances(details: Dict[str, Any], target_eur: float, max_margin_eur: float) -> Tuple[
     float, float, float, str]:
-    """Compute deal size, TP/SL distances (points), and currency for ~target P&L.
-
-    The algorithm:
-      - Starts with minimum viable size, computes points to target ≈ target_eur.
-      - Ensures distances respect min stop/limit rules.
-      - Estimates margin and scales size down if it exceeds max_margin_eur.
-
-    Args:
-        details: Instrument details from market_details().
-        target_eur: Desired take-profit value per trade in EUR (approximate).
-        max_margin_eur: Maximum estimated margin budget to allow.
-
-    Returns:
-        Tuple (size, limit_distance_points, stop_distance_points, currency_code),
-        all rounded reasonably for submission.
-
-    Notes:
-        Uses STOP_TO_LIMIT_MULTIPLIER for SL distance (> min stop).
-    """
+    """Compute deal size, TP/SL distances (points), and currency for ~target P&L."""
     instr = details["instrument"]
     rules = details.get("dealingRules", {})
 
@@ -548,7 +473,7 @@ def compute_size_and_distances(details: Dict[str, Any], target_eur: float, max_m
     min_stop = float(rules.get("minNormalStopOrLimitDistance", {}).get("value", 0.1))
     min_size = float(rules.get("minDealSize", {}).get("value", 0.1))
 
-    # start with size=1, derive points for ≈€1
+    # start with size=1, derive points for ≈ target_eur
     size = max(1.0, min_size)
     pips_needed = max(1e-9, target_eur / (pip_value_eur * size))
     points_needed = pips_needed * ppp
@@ -575,67 +500,150 @@ def compute_size_and_distances(details: Dict[str, Any], target_eur: float, max_m
     return round(size, 2), round(limit_distance, 2), round(stop_distance, 2), currency
 
 
-# ----- micro strategy & lifecycle -----
+# ===== micro strategy & lifecycle =====
 
 def momentum_direction(ig: IGRest, epic: str) -> str:
-    """Tiny momentum heuristic based on last two 1-minute candle closes.
-
-    Args:
-        ig: IGRest client.
-        epic: Market epic to inspect.
-
-    Returns:
-        'BUY' if the most recent close is >= previous close, else 'SELL'.
-        Falls back to 'BUY' on any error or insufficient data.
-    """
-    """Very small REST-only momentum: compare last two 1-min closes."""
+    """Tiny momentum heuristic based on last two 1-minute candle closes."""
     try:
         pr = ig.recent_prices(epic, "MINUTE", 3).get("prices", [])
         if len(pr) >= 2:
-            def mid(px): return px.get("closePrice", {}).get("mid") or (
-                    (px["closePrice"].get("bid") + px["closePrice"].get("ask")) / 2.0
-            )
+            def mid(px):
+                cp = px.get("closePrice", {})
+                m = cp.get("mid")
+                if m is None:
+                    b = cp.get("bid")
+                    a = cp.get("ask")
+                    if b is not None and a is not None:
+                        m = (b + a) / 2.0
+                return m
 
-            return "BUY" if mid(pr[-1]) >= mid(pr[-2]) else "SELL"
+            return "BUY" if float(mid(pr[-1])) >= float(mid(pr[-2])) else "SELL"
     except Exception:
         pass
     return "BUY"
 
 
-def wait_until_closed_or_timeout(ig: IGRest, deal_id: str, max_wait_s: int) -> bool:
-    """Poll open positions until a given dealId disappears or a timeout elapses.
+def latest_mid_and_spread(bars: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float]]:
+    """Return (mid_close, spread_points) from last bar."""
+    if not bars:
+        return None, None
+    cp = bars[-1].get("closePrice", {})
+    bid, ask, mid = cp.get("bid"), cp.get("ask"), cp.get("mid")
+    if mid is None and bid is not None and ask is not None:
+        mid = (bid + ask) / 2.0
+    spread = None
+    if bid is not None and ask is not None:
+        spread = ask - bid
+    return (float(mid) if mid is not None else None,
+            float(spread) if spread is not None else None)
 
-    Args:
-        ig: IGRest client.
-        deal_id: Deal id to watch for closure.
-        max_wait_s: Maximum seconds to wait before giving up.
 
-    Returns:
-        True if the position was closed within the timeout; False otherwise.
+def trade_manager(ig: IGRest, deal_id: str, epic: str, currency: str, is_long: bool,
+                  entry_level: float, tp_pts: float, ig_min_stop_points: float) -> bool:
+    """Manage an open trade until it closes. Returns True if exit likely >= ~€1, else False.
+
+    Logic:
+      - If move >= BREAKEVEN_TRIGGER_RATIO * TP: set breakeven + activate trailing stop
+        with ATR-scaled distance/increment (clamped by IG min stop).
+      - Exit immediately if signal invalidates (close < EMA for long, > EMA for short).
+      - Exit if ATR collapses below threshold or spread spikes.
+      - Polls for closure (TP/SL/trailing) every few seconds.
     """
-    start = time.time()
-    while not stop_event.is_set() and (time.time() - start) < max_wait_s:
-        try:
-            pos = ig.list_positions()
-            if not any(p.get("position", {}).get("dealId") == deal_id for p in pos.get("positions", [])):
-                return True
-        except Exception:
-            pass
+    trailing_activated = False
+    approx_favourable = False  # set True if we reached meaningful favourable move
+
+    while not stop_event.is_set():
+        # If position is gone, we are done
+        positions = ig.list_positions()
+        pos_row = None
+        for p in positions.get("positions", []):
+            if p.get("position", {}).get("dealId") == deal_id:
+                pos_row = p
+                break
+        if pos_row is None:
+            # infer favourability from last price move if we can
+            bars = ig.recent_prices(epic, "MINUTE", 2).get("prices", [])
+            last_mid, _ = latest_mid_and_spread(bars)
+            if last_mid is not None:
+                move_pts = (last_mid - entry_level) if is_long else (entry_level - last_mid)
+                if move_pts >= (tp_pts * 0.8) or trailing_activated:
+                    approx_favourable = True
+            return approx_favourable
+
+        # Get fresh bars to compute ATR, EMA, spread
+        bars = ig.recent_prices(epic, "MINUTE", max(ATR_PERIOD + 2, 30)).get("prices", [])
+        if len(bars) == 0:
+            time.sleep(POLL_POSITIONS_SEC)
+            continue
+        atr = compute_atr_points(bars, ATR_PERIOD)
+        ema20 = ema_of_closes(bars, EMA_PERIOD)
+        last_mid, spread = latest_mid_and_spread(bars)
+        if last_mid is None or math.isnan(atr) or math.isnan(ema20):
+            time.sleep(POLL_POSITIONS_SEC)
+            continue
+
+        move_pts = (last_mid - entry_level) if is_long else (entry_level - last_mid)
+
+        # Activate trailing at ~half TP set stop to breakeven + tiny cushion
+        if (not trailing_activated) and move_pts >= (tp_pts * BREAKEVEN_TRIGGER_RATIO):
+            trail_dist = max(atr * TRAIL_DIST_ATR_MULT, ig_min_stop_points)
+            trail_step = max(atr * TRAIL_STEP_ATR_MULT, MIN_TRAIL_STEP_POINTS)
+            breakeven = entry_level + (BREAKEVEN_OFFSET_POINTS if is_long else -BREAKEVEN_OFFSET_POINTS)
+            try:
+                ig.update_position(
+                    deal_id,
+                    trailing_stop=True,
+                    trailing_stop_distance=round(trail_dist, 2),
+                    trailing_stop_increment=round(trail_step, 2),
+                    stop_level=round(breakeven, 2)
+                )
+                trailing_activated = True
+                approx_favourable = True  # we got a decent push
+                logging.info("Trailing activated: dist=%.2f, step=%.2f, stopLevel≈%.2f",
+                             trail_dist, trail_step, breakeven)
+            except Exception as e:
+                logging.warning("Failed to activate trailing: %s", e)
+
+        # Signal invalidation: opposite side of EMA20
+        if (is_long and last_mid < ema20) or ((not is_long) and last_mid > ema20):
+            try:
+                # Net-off for reliability
+                position = pos_row["position"]
+                market = pos_row.get("market", {})
+                ig.close_position_market(
+                    deal_id,
+                    position["direction"],
+                    float(position["size"]),
+                    epic=position.get("epic") or market.get("epic"),
+                    expiry=position.get("expiry") or market.get("expiry"),
+                    currency=position.get("currency") or market.get("currency")
+                )
+            except Exception as e:
+                logging.warning("Invalidation close failed: %s", e)
+            return approx_favourable
+
+        # Volatility/spread exit
+        if (atr < ATR_MIN_THRESHOLD) or (spread is not None and spread > SPREAD_MAX_POINTS):
+            try:
+                position = pos_row["position"]
+                market = pos_row.get("market", {})
+                ig.close_position_market(
+                    deal_id,
+                    position["direction"],
+                    float(position["size"]),
+                    epic=position.get("epic") or market.get("epic"),
+                    expiry=position.get("expiry") or market.get("expiry"),
+                    currency=position.get("currency") or market.get("currency")
+                )
+            except Exception as e:
+                logging.warning("Vol/Spread exit failed: %s", e)
+            return approx_favourable
+
         time.sleep(POLL_POSITIONS_SEC)
-    return False
 
 
 def close_all_positions(ig: IGRest, epic: str | None = None) -> None:
-    """Attempt to close all (or all matching) open positions at market.
-
-    Iterates through GET /positions and calls close_position_market for each,
-    logging any failures but continuing through the list.
-
-    Args:
-        ig: IGRest client.
-        epic: Optional epic to filter; if provided, only positions on this epic
-            will be closed.
-    """
+    """Attempt to close all (or all matching) open positions at market."""
     try:
         pos = ig.list_positions()
         for p in pos.get("positions", []):
@@ -661,15 +669,18 @@ def close_all_positions(ig: IGRest, epic: str | None = None) -> None:
         logging.warning("List positions during shutdown failed: %s", e)
 
 
+# ===== main loop =====
+
 def main():
-    """Run the demo scalper loop until target is reached or a stop signal arrives.
+    """Run the demo scalper until target is reached or a stop signal arrives.
 
     Flow:
         - Login and select a Germany 40 market matching the account type.
         - Compute size/TP/SL to target ≈ €1 per trade within a margin budget.
-        - Repeatedly place a MARKET order following a tiny momentum signal and
-          wait for TP or timeout; on timeout, close manually.
-        - Re-compute sizing periodically in case of rules/price changes.
+        - Entry gating: only trade when ATR >= threshold and spread <= max.
+        - Place a MARKET order (simple momentum bias).
+        - Manage open trade via breakeven + trailing + invalidation/volatility exits (no hard timeout).
+        - Re-compute sizing periodically (rules/price may change).
         - On exit or signal, attempt to close any remaining positions and logout.
     """
     api_key = os.environ.get("API_KEY")
@@ -684,12 +695,7 @@ def main():
     ig = IGRest(api_key, username, password, account_id)
 
     def handle_signal(sig, frame):
-        """Signal handler to stop the run, close positions, logout, and exit.
-
-        Args:
-            sig: The received signal number.
-            frame: Current stack frame (ignored).
-        """
+        """Signal handler to stop the run, close positions, logout, and exit."""
         logging.warning("Signal %s received: closing positions and shutting down…", sig)
         stop_event.set()
         try:
@@ -711,15 +717,40 @@ def main():
         size, tp_pts, sl_pts, currency = compute_size_and_distances(details, PER_TRADE_TARGET_EUR, 500.0)
         logging.info("Initial sizing: size=%.2f, TP=%.2f pts, SL=%.2f pts, currency=%s", size, tp_pts, sl_pts, currency)
 
+        # Pull IG min stop once for trailing clamping
+        ig_min_stop_points = float(
+            details.get("dealingRules", {}).get("minNormalStopOrLimitDistance", {}).get("value", 0.1))
+
         realized_approx = 0.0
         trade_num = 0
 
         while (realized_approx + 1e-6) < DAILY_TARGET_EUR and not stop_event.is_set():
-            trade_num += 1
+            # Entry gating: ATR and spread must be reasonable
+            bars = ig.recent_prices(epic, "MINUTE", max(ATR_PERIOD + 2, 30)).get("prices", [])
+            if not bars:
+                time.sleep(2.0)
+                continue
+            atr = compute_atr_points(bars, ATR_PERIOD)
+            last_mid, spread = latest_mid_and_spread(bars)
+            if (math.isnan(atr) or last_mid is None or
+                    atr < ATR_MIN_THRESHOLD or
+                    (spread is not None and spread > SPREAD_MAX_POINTS)):
+                logging.info("Skip entry: ATR=%.2f (min %.2f), spread=%s (max %.2f)",
+                             atr if not math.isnan(atr) else float("nan"),
+                             ATR_MIN_THRESHOLD,
+                             f"{spread:.2f}" if spread is not None else "n/a",
+                             SPREAD_MAX_POINTS)
+                time.sleep(5.0)
+                continue
+
+            # Micro-bias
             direction = momentum_direction(ig, epic)
+            is_long = (direction.upper() == "BUY")
+            trade_num += 1
             logging.info("Trade #%d: %s %s size=%.2f | TP=%.2f pts (≈€%.2f), SL=%.2f pts",
                          trade_num, direction, epic, size, tp_pts, PER_TRADE_TARGET_EUR, sl_pts)
 
+            # Open
             try:
                 deal_ref, confirm = ig.open_market_position(
                     epic=epic,
@@ -741,23 +772,37 @@ def main():
                 time.sleep(RETRY_BACKOFF_SEC)
                 continue
 
-            closed_by_tp = wait_until_closed_or_timeout(ig, deal_id, MAX_HOLD_SECONDS)
-            if not closed_by_tp:
-                logging.info("Timeout: closing manually at market…")
-                try:
-                    pos = ig.list_positions()
-                    for p in pos.get("positions", []):
-                        if p.get("position", {}).get("dealId") == deal_id:
-                            ig.close_position_market(deal_id, p["position"]["direction"], float(p["position"]["size"]))
-                            break
-                except Exception as e:
-                    logging.warning("Manual close failed: %s", e)
+            # Get entry level & manage trade until it closes
+            try:
+                pos = ig.list_positions()
+                entry_level = None
+                for p in pos.get("positions", []):
+                    if p.get("position", {}).get("dealId") == deal_id:
+                        entry_level = float(p["position"]["level"])
+                        break
+                if entry_level is None:
+                    # fallback: use last mid as a rough stand-in
+                    entry_level = float(last_mid)
+            except Exception:
+                entry_level = float(last_mid) if last_mid is not None else None
 
-            if closed_by_tp:
+            favourable = trade_manager(
+                ig=ig,
+                deal_id=deal_id,
+                epic=epic,
+                currency=currency,
+                is_long=is_long,
+                entry_level=entry_level,
+                tp_pts=tp_pts,
+                ig_min_stop_points=ig_min_stop_points
+            )
+
+            if favourable:
                 realized_approx += PER_TRADE_TARGET_EUR
-                logging.info("TP hit. Session realized ≈ €%.2f / €%.2f target", realized_approx, DAILY_TARGET_EUR)
+                logging.info("Favourable exit. Session realized ≈ €%.2f / €%.2f target",
+                             realized_approx, DAILY_TARGET_EUR)
             else:
-                logging.info("Closed manually; not counting this towards €1-per-trade goal.")
+                logging.info("Unfavourable/neutral exit not adding to €1-per-trade goal.")
 
             # Re-check sizing in case rules/price changed
             try:
@@ -778,7 +823,11 @@ def main():
 
 
 if __name__ == "__main__":
-    from dotenv import load_dotenv
+    # Optional: load .env for API_KEY / USERNAME / PASSWORD / ACCOUNT_ID
+    try:
+        from dotenv import load_dotenv
 
-    load_dotenv(".env", override=True)
+        load_dotenv(".env", override=True)
+    except Exception:
+        pass
     main()
