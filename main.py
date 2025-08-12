@@ -22,13 +22,14 @@ DEMO_BASE = "https://demo-api.ig.com/gateway/deal"
 # Strategy targets
 PER_TRADE_TARGET_EUR = 1.0
 DAILY_TARGET_EUR = 10.0
-MAX_HOLD_SECONDS = 300           # close manually if TP not hit within 5 minutes
-STOP_TO_LIMIT_MULTIPLIER = 3.0   # SL distance = 3x TP distance (rounded & >= min stop)
+MAX_HOLD_SECONDS = 300  # close manually if TP not hit within 5 minutes
+STOP_TO_LIMIT_MULTIPLIER = 3.0  # SL distance = 3x TP distance (rounded & >= min stop)
 
 POLL_POSITIONS_SEC = 2.0
 RETRY_BACKOFF_SEC = 1.0
 
 stop_event = threading.Event()
+
 
 class IGRest:
     """Minimal IG REST API client focused on market, pricing, and OTC dealing calls.
@@ -241,13 +242,13 @@ class IGRest:
     # ----- dealing -----
 
     def open_market_position(
-        self,
-        epic: str,
-        direction: str,
-        size: float,
-        currency: str,
-        limit_distance_points: float,
-        stop_distance_points: Optional[float],
+            self,
+            epic: str,
+            direction: str,
+            size: float,
+            currency: str,
+            limit_distance_points: float,
+            stop_distance_points: Optional[float],
     ) -> Tuple[str, Dict[str, Any]]:
         """Open a MARKET position with attached limit/stop distances.
 
@@ -431,6 +432,7 @@ class IGRest:
 
         raise RuntimeError(f"Close position failed: HTTP {r.status_code} {err_code or r.text[:200]}")
 
+
 # ----- sizing & selection -----
 
 def _points_per_pip(one_pip_means: str) -> float:
@@ -449,6 +451,7 @@ def _points_per_pip(one_pip_means: str) -> float:
         return float(one_pip_means.strip().split()[0])
     except Exception:
         return 1.0
+
 
 def choose_germany40_epic(ig: IGRest) -> Tuple[str, Dict[str, Any]]:
     """Select a Germany 40 market epic that matches the account's unit type.
@@ -509,7 +512,9 @@ def choose_germany40_epic(ig: IGRest) -> Tuple[str, Dict[str, Any]]:
     logging.info("Chosen EPIC %s (status=%s, unit=%s)", epic, status, details["instrument"]["unit"])
     return epic, details
 
-def compute_size_and_distances(details: Dict[str, Any], target_eur: float, max_margin_eur: float) -> Tuple[float, float, float, str]:
+
+def compute_size_and_distances(details: Dict[str, Any], target_eur: float, max_margin_eur: float) -> Tuple[
+    float, float, float, str]:
     """Compute deal size, TP/SL distances (points), and currency for ~target P&L.
 
     The algorithm:
@@ -540,8 +545,8 @@ def compute_size_and_distances(details: Dict[str, Any], target_eur: float, max_m
     )
 
     min_limit = float(rules.get("minNormalStopOrLimitDistance", {}).get("value", 0.1))
-    min_stop  = float(rules.get("minNormalStopOrLimitDistance", {}).get("value", 0.1))
-    min_size  = float(rules.get("minDealSize", {}).get("value", 0.1))
+    min_stop = float(rules.get("minNormalStopOrLimitDistance", {}).get("value", 0.1))
+    min_size = float(rules.get("minDealSize", {}).get("value", 0.1))
 
     # start with size=1, derive points for ≈€1
     size = max(1.0, min_size)
@@ -551,7 +556,7 @@ def compute_size_and_distances(details: Dict[str, Any], target_eur: float, max_m
         pips_needed = max(1e-9, (min_limit / ppp))
         size = max(min_size, target_eur / (pip_value_eur * pips_needed))
     limit_distance = max(min_limit, points_needed)
-    stop_distance  = max(min_stop,  limit_distance * STOP_TO_LIMIT_MULTIPLIER)
+    stop_distance = max(min_stop, limit_distance * STOP_TO_LIMIT_MULTIPLIER)
 
     # crude margin estimate & scale to budget
     price = float((details.get("snapshot", {}) or {}).get("offer") or 20000.0)
@@ -565,9 +570,10 @@ def compute_size_and_distances(details: Dict[str, Any], target_eur: float, max_m
         pips_needed = max(1e-9, target_eur / (pip_value_eur * size))
         points_needed = pips_needed * ppp
         limit_distance = max(min_limit, points_needed)
-        stop_distance  = max(min_stop,  limit_distance * STOP_TO_LIMIT_MULTIPLIER)
+        stop_distance = max(min_stop, limit_distance * STOP_TO_LIMIT_MULTIPLIER)
 
     return round(size, 2), round(limit_distance, 2), round(stop_distance, 2), currency
+
 
 # ----- micro strategy & lifecycle -----
 
@@ -587,12 +593,14 @@ def momentum_direction(ig: IGRest, epic: str) -> str:
         pr = ig.recent_prices(epic, "MINUTE", 3).get("prices", [])
         if len(pr) >= 2:
             def mid(px): return px.get("closePrice", {}).get("mid") or (
-                (px["closePrice"].get("bid") + px["closePrice"].get("ask")) / 2.0
+                    (px["closePrice"].get("bid") + px["closePrice"].get("ask")) / 2.0
             )
+
             return "BUY" if mid(pr[-1]) >= mid(pr[-2]) else "SELL"
     except Exception:
         pass
     return "BUY"
+
 
 def wait_until_closed_or_timeout(ig: IGRest, deal_id: str, max_wait_s: int) -> bool:
     """Poll open positions until a given dealId disappears or a timeout elapses.
@@ -616,6 +624,7 @@ def wait_until_closed_or_timeout(ig: IGRest, deal_id: str, max_wait_s: int) -> b
         time.sleep(POLL_POSITIONS_SEC)
     return False
 
+
 def close_all_positions(ig: IGRest, epic: str | None = None) -> None:
     """Attempt to close all (or all matching) open positions at market.
 
@@ -631,13 +640,13 @@ def close_all_positions(ig: IGRest, epic: str | None = None) -> None:
         pos = ig.list_positions()
         for p in pos.get("positions", []):
             position = p.get("position", {}) or {}
-            market   = p.get("market", {}) or {}
-            deal_id   = position.get("dealId")
+            market = p.get("market", {}) or {}
+            deal_id = position.get("dealId")
             direction = position.get("direction")
-            size      = float(position.get("size", 0) or 0)
+            size = float(position.get("size", 0) or 0)
             inst_epic = position.get("epic") or market.get("epic")
-            expiry    = position.get("expiry") or market.get("expiry") or "-"
-            currency  = position.get("currency") or market.get("currency") or "EUR"
+            expiry = position.get("expiry") or market.get("expiry") or "-"
+            currency = position.get("currency") or market.get("currency") or "EUR"
             if not deal_id or size <= 0:
                 continue
             if epic and inst_epic != epic:
@@ -663,10 +672,10 @@ def main():
         - Re-compute sizing periodically in case of rules/price changes.
         - On exit or signal, attempt to close any remaining positions and logout.
     """
-    api_key   = os.environ.get("API_KEY")
-    username  = os.environ.get("USERNAME")
-    password  = os.environ.get("PASSWORD")
-    account_id= os.environ.get("ACCOUNT_ID")
+    api_key = os.environ.get("API_KEY")
+    username = os.environ.get("USERNAME")
+    password = os.environ.get("PASSWORD")
+    account_id = os.environ.get("ACCOUNT_ID")
 
     if not all([api_key, username, password]):
         print("Set API_KEY, USERNAME, PASSWORD (and ACCOUNT_ID) as env vars.", file=sys.stderr)
@@ -767,8 +776,9 @@ def main():
         ig.logout()
         logging.info("Logged out. Bye.")
 
+
 if __name__ == "__main__":
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv(".env", override=True)
     main()
