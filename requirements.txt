@@ -1,0 +1,7 @@
+trading-ig
+pandas
+numpy
+pytz
+lightstreamer-client
+munch
+python-dotenv
