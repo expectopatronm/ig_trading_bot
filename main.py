@@ -90,9 +90,12 @@ class IGRest:
             "Accept": "application/json charset=UTF-8",
             "Content-Type": "application/json",
         }
-        if self.cst: h["CST"] = self.cst
-        if self.xst: h["X-SECURITY-TOKEN"] = self.xst
-        if version:  h["VERSION"] = version
+        if self.cst:
+            h["CST"] = self.cst
+        if self.xst:
+            h["X-SECURITY-TOKEN"] = self.xst
+        if version:
+            h["VERSION"] = version
         return h
 
     def _request(self, method: str, url: str, version: Optional[str] = None, **kwargs) -> requests.Response:
