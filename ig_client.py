@@ -105,7 +105,6 @@ class IGRest:
                         headers=self._headers("2"),
                         json={"identifier": self.username, "password": self.password},
                         timeout=20)
-        print(r)
         if r.status_code not in (200, 201):
             raise RuntimeError(f"Login failed: HTTP {r.status_code} {r.text[:400]}")
         self.cst = r.headers.get("CST")
