@@ -5,14 +5,15 @@ from dataclasses import dataclass, field
 from typing import Deque, Dict, Optional, Tuple
 
 # Default heuristics (can be overridden via env-driven config in main)
-DEFAULT_TRADE_PER_MIN = 35         # IG docs often cite ~40/min; keep a safety buffer
-DEFAULT_DATA_PER_MIN  = 120        # data/snapshots/etc.
-DEFAULT_HIST_POINTS_WEEK = 10000   # common demo allowance; varies
+DEFAULT_TRADE_PER_MIN = 35  # IG docs often cite ~40/min; keep a safety buffer
+DEFAULT_DATA_PER_MIN = 120  # data/snapshots/etc.
+DEFAULT_HIST_POINTS_WEEK = 10000  # common demo allowance; varies
 
 # Simple URL bucketing
-_TRADE_PAT  = re.compile(r"/positions/otc|/workingorders", re.I)
-_DATA_PAT   = re.compile(r"/prices/|/markets/|/positions\b|/clientsentiment", re.I)
-_AUTH_PAT   = re.compile(r"/session\b|/session/refresh-token\b", re.I)
+_TRADE_PAT = re.compile(r"/positions/otc|/workingorders", re.I)
+_DATA_PAT = re.compile(r"/prices/|/markets/|/positions\b|/clientsentiment", re.I)
+_AUTH_PAT = re.compile(r"/session\b|/session/refresh-token\b", re.I)
+
 
 def bucket_for(method: str, url: str) -> str:
     if _TRADE_PAT.search(url) and method.upper() in ("POST", "PUT", "DELETE"):
@@ -23,11 +24,13 @@ def bucket_for(method: str, url: str) -> str:
         return "data"
     return "other"
 
+
 @dataclass
 class RateLimits:
     trade_per_min: int = DEFAULT_TRADE_PER_MIN
-    data_per_min:  int = DEFAULT_DATA_PER_MIN
+    data_per_min: int = DEFAULT_DATA_PER_MIN
     hist_points_week: int = DEFAULT_HIST_POINTS_WEEK
+
 
 @dataclass
 class WindowCounter:
@@ -53,6 +56,7 @@ class WindowCounter:
             return 0
         return max(0, int((self.stamps[0] + 60.0) - now))
 
+
 @dataclass
 class WeeklyPoints:
     """Rolling 7-day datapoint usage (for historical candles)."""
@@ -73,15 +77,17 @@ class WeeklyPoints:
         while self.points and self.points[0][0] < cutoff:
             self.points.popleft()
 
+
 class QuotaTracker:
     """Tracks per-bucket request rates and historical datapoints; surfaces server rate headers if present."""
+
     def __init__(self, limits: RateLimits):
         self.lim = limits
         self.lock = threading.Lock()
         self.win: Dict[str, WindowCounter] = {
             "trade": WindowCounter(),
-            "data":  WindowCounter(),
-            "auth":  WindowCounter(),
+            "data": WindowCounter(),
+            "auth": WindowCounter(),
             "other": WindowCounter(),
         }
         self.week = WeeklyPoints()
@@ -108,27 +114,29 @@ class QuotaTracker:
     def snapshot(self) -> Dict[str, Dict[str, int | str]]:
         now = time.time()
         with self.lock:
-            td_used  = self.win["trade"].count_last_60s(now)
-            dt_used  = self.win["data"].count_last_60s(now)
-            au_used  = self.win["auth"].count_last_60s(now)
-            ot_used  = self.win["other"].count_last_60s(now)
-            td_rem   = max(0, self.lim.trade_per_min - td_used)
-            dt_rem   = max(0, self.lim.data_per_min  - dt_used)
+            td_used = self.win["trade"].count_last_60s(now)
+            dt_used = self.win["data"].count_last_60s(now)
+            au_used = self.win["auth"].count_last_60s(now)
+            ot_used = self.win["other"].count_last_60s(now)
+            td_rem = max(0, self.lim.trade_per_min - td_used)
+            dt_rem = max(0, self.lim.data_per_min - dt_used)
             td_reset = self.win["trade"].seconds_until_reset(now)
             dt_reset = self.win["data"].seconds_until_reset(now)
             week_used = self.week.used_last_7d(now)
-            week_rem  = max(0, self.lim.hist_points_week - week_used)
+            week_rem = max(0, self.lim.hist_points_week - week_used)
             return {
                 "trade": {"used": td_used, "limit": self.lim.trade_per_min, "remaining": td_rem, "reset_s": td_reset},
-                "data":  {"used": dt_used, "limit": self.lim.data_per_min,  "remaining": dt_rem, "reset_s": dt_reset},
-                "auth":  {"used": au_used},
+                "data": {"used": dt_used, "limit": self.lim.data_per_min, "remaining": dt_rem, "reset_s": dt_reset},
+                "auth": {"used": au_used},
                 "other": {"used": ot_used},
-                "hist":  {"used": week_used, "limit": self.lim.hist_points_week, "remaining": week_rem},
+                "hist": {"used": week_used, "limit": self.lim.hist_points_week, "remaining": week_rem},
                 "headers": self.server_headers.copy(),
             }
 
+
 class QuotaReporter(threading.Thread):
     """Logs a one-liner quota snapshot every `interval_sec` seconds."""
+
     def __init__(self, tracker: QuotaTracker, interval_sec: float = 30.0, stop_evt: Optional[threading.Event] = None):
         super().__init__(daemon=True)
         self.t = tracker
@@ -143,8 +151,8 @@ class QuotaReporter(threading.Thread):
             logging.info(
                 "Quota | trade %d/%d (rem %d, %ss) | data %d/%d (rem %d, %ss) | hist %d/%d (rem %d)%s",
                 snap["trade"]["used"], snap["trade"]["limit"], snap["trade"]["remaining"], snap["trade"]["reset_s"],
-                snap["data"]["used"],  snap["data"]["limit"],  snap["data"]["remaining"],  snap["data"]["reset_s"],
-                snap["hist"]["used"],  snap["hist"]["limit"],  snap["hist"]["remaining"],
+                snap["data"]["used"], snap["data"]["limit"], snap["data"]["remaining"], snap["data"]["reset_s"],
+                snap["hist"]["used"], snap["hist"]["limit"], snap["hist"]["remaining"],
                 hdr
             )
             time.sleep(self.iv)

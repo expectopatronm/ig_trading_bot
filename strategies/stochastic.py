@@ -5,6 +5,7 @@ stochastic.py — IG 'Stochastic oscillator' scalping:
 
 from indicators import extract_ohlc, sma, stoch_kd
 
+
 def stochastic_direction(ig, epic: str, k_period: int, d_period: int,
                          k_lo: float, k_hi: float, ma_trend: int) -> str | None:
     need = max(ma_trend + k_period + d_period + 2, 230)
@@ -14,7 +15,7 @@ def stochastic_direction(ig, epic: str, k_period: int, d_period: int,
         return None
     ma200_now = sma(closes, ma_trend)
     ma200_prev = sma(closes[:-1], ma_trend)
-    trend_up   = ma200_now > ma200_prev
+    trend_up = ma200_now > ma200_prev
     trend_down = ma200_now < ma200_prev
 
     k_vals, d_vals = stoch_kd(closes, highs, lows, k_period, d_period)

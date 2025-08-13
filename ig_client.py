@@ -4,6 +4,7 @@ REST only (no streaming). Handles 401 refresh and common dealing ops.
 Now augmented to feed the QuotaTracker with every request and to count historical datapoints.
 """
 
+import time
 import logging
 import requests
 from typing import Dict, Any, Optional, Tuple, List
@@ -56,7 +57,6 @@ class IGRest:
         if r == "DAY":
             return 86400
         return 60
-
 
     def _headers(self, version: Optional[str] = None) -> Dict[str, str]:
         h = {
@@ -166,7 +166,7 @@ class IGRest:
         Fetch a small window of recent prices for a market (candles) and record datapoints.
 
         Quota-friendly behavior:
-        - If PRICE_CACHE_ENABLED and we fetched within the current bar period, serve from cache.
+        - If PRICE_CACHE_ENABLED, and we fetched within the current bar period, serve from cache.
         - If weekly historical allowance is low (<= HIST_RESERVE_POINTS), prefer cached data (even if a bit stale)
           up to PRICE_CACHE_STALE_SEC, to avoid 403s.
         """
@@ -210,7 +210,8 @@ class IGRest:
             hist_remaining = None
 
         use_cache_due_to_quota = (
-            PRICE_CACHE_ENABLED and cached and hist_remaining is not None and hist_remaining <= max(0, int(HIST_RESERVE_POINTS))
+                PRICE_CACHE_ENABLED and cached and hist_remaining is not None and hist_remaining <= max(0,
+                                                                                                        int(HIST_RESERVE_POINTS))
         )
         cache_fresh = cached is not None and (now - last_fetch) < max(1, int(0.95 * period))
 
@@ -226,17 +227,16 @@ class IGRest:
         # Otherwise, fetch from network (first call or cache expired)
         return _fetch()
 
-
     # ----- dealing -----
 
     def open_market_position(
-        self,
-        epic: str,
-        direction: str,
-        size: float,
-        currency: str,
-        limit_distance_points: float,
-        stop_distance_points: float | None,
+            self,
+            epic: str,
+            direction: str,
+            size: float,
+            currency: str,
+            limit_distance_points: float,
+            stop_distance_points: float | None,
     ) -> tuple[str, dict]:
         expiry = "-" if (self.account_type or "CFD").upper() == "CFD" else "DFB"
         payload = {

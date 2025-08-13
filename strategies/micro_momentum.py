@@ -13,7 +13,7 @@ def momentum_direction(ig, epic: str) -> str:
                 cp = px.get("closePrice", {})
                 m = cp.get("mid")
                 if m is None:
-                    b = cp.get("bid");
+                    b = cp.get("bid")
                     a = cp.get("ask")
                     if b is not None and a is not None:
                         m = (b + a) / 2.0

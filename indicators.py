@@ -83,7 +83,7 @@ def latest_mid_and_spread(bars: List[Dict[str, Any]]) -> Tuple[Optional[float], 
     spread = None
     if bid is not None and ask is not None:
         spread = ask - bid
-    return (float(mid) if mid is not None else None, float(spread) if spread is not None else None)
+    return float(mid) if mid is not None else None, float(spread) if spread is not None else None
 
 
 def rsi_series(closes: List[float], period: int = 14) -> List[float]:
