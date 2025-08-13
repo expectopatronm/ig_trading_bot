@@ -1,4 +1,4 @@
-# IG REST DAX Scalper (Demo) — README (v2)
+# IG REST DAX Scalper
 
 > **What this is:** a REST‑only Python bot that scalps the **Germany 40 (DAX)** on **IG’s DEMO**.  
 > **Goal:** aim for ~**€1** per trade and repeat until **~€10/day**.  
@@ -7,6 +7,11 @@
 > **Disclaimer:** This is **not financial advice**. CFDs/spread bets are leveraged and can lose money rapidly. Use **demo** first.
 
 ---
+## Strategy Reference
+
+This script is a REST-only DAX (Germany 40) micro-scalper for IG’s demo API that hunts for ~€1 per trade and loops until about €10 daily, while tightly gating entries and managing risk. It auto-logs in, picks a Germany 40 epic matching the active account type (CFD vs spread-bet), then sizes each order from instrument metadata so the take-profit distance in points maps to ~€1 given pip value and minimum IG limits, with a stop set at 3× the TP distance (and overall margin kept modest). It trades only inside configurable Europe/Berlin session windows (skip weekends), and only if volatility and costs are acceptable: ATR(14, 1-min) must exceed a threshold and the current spread must be below a cap. Direction is a tiny momentum heuristic (BUY if the last 1-min close ≥ the prior, else SELL). After entry, a manager loop watches 1-min data: once price moves ≥50% of TP, it moves the stop to a tiny positive breakeven and enables a trailing stop whose distance and step scale with ATR (clamped by IG minimums). It will also exit early if the signal invalidates (price crosses the 20-EMA against the position) or if conditions deteriorate (ATR falls below the floor or spread spikes), and it continually re-derives sizing from fresh market details between trades. The program refreshes tokens on 401s, polls positions, and shuts down gracefully on signals by closing any open trades before logging out.
+
+--- 
 
 ## Quick start
 

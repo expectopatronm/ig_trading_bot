@@ -1,3 +1,4 @@
+requests
 trading-ig
 pandas
 numpy
