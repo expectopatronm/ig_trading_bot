@@ -10,7 +10,14 @@ from typing import List, Tuple
 # ===== Strategy targets & risk =====
 PER_TRADE_TARGET_EUR: float = float(os.environ.get("PER_TRADE_TARGET_EUR", "1.0"))
 DAILY_TARGET_EUR: float = float(os.environ.get("DAILY_TARGET_EUR", "10.0"))
-STOP_TO_LIMIT_MULTIPLIER: float = float(os.environ.get("STOP_TO_LIMIT_MULTIPLIER", "3.0"))
+
+# IMPORTANT: default to 1.0 (not 3.0). We clamp to >=1.0 in sizing so stop distance
+# is never smaller than the limit (TP) distance.
+STOP_TO_LIMIT_MULTIPLIER: float = float(os.environ.get("STOP_TO_LIMIT_MULTIPLIER", "1.0"))
+
+# NEW: Day-level risk guardrails
+DAILY_MAX_LOSS_EUR: float = float(os.environ.get("DAILY_MAX_LOSS_EUR", "10.0"))
+MAX_CONSECUTIVE_LOSSES: int = int(os.environ.get("MAX_CONSECUTIVE_LOSSES", "5"))
 
 # ===== Ledger / balance =====
 # Starting balance used to initialise the ledger the very first time only.
@@ -18,6 +25,12 @@ START_BALANCE_EUR: float = float(os.environ.get("START_BALANCE_EUR", "500.0"))
 LEDGER_DIR: str = os.environ.get("LEDGER_DIR", "ledger")
 LEDGER_TRADES_CSV: str = os.environ.get("LEDGER_TRADES_CSV", os.path.join(LEDGER_DIR, "trades.csv"))
 LEDGER_STATE_JSON: str = os.environ.get("LEDGER_STATE_JSON", os.path.join(LEDGER_DIR, "state.json"))
+
+# ===== Budget / leverage for sizing =====
+# We size so that: exposure <= working_capital * EFFECTIVE_LEVERAGE
+# and margin   <= working_capital * MARGIN_UTILIZATION
+EFFECTIVE_LEVERAGE: float = float(os.environ.get("EFFECTIVE_LEVERAGE", "5.0"))
+MARGIN_UTILIZATION: float = float(os.environ.get("MARGIN_UTILIZATION", "1.0"))  # 1.0 = up to 100% of budget as margin
 
 # ===== Entry filters / management =====
 EMA_PERIOD: int = int(os.environ.get("EMA_PERIOD", "20"))

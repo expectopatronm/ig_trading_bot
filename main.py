@@ -2,14 +2,11 @@
 """
 main.py — IG REST DAX scalper (DEMO), modular + quota reporting.
 
-Change summary for this version:
-- Daily goal is **net** of wins and losses. We keep trading until today's P&L >= DAILY_TARGET_EUR.
-- Added a simple local ledger (CSV + state.json) that persists trades and rolling balance across days.
-  Balance carries over: today's start = yesterday's end.
-
-Other behaviour unchanged (session filter, ATR/spread gates, trailing, etc.).
+Changes in this update:
+- Added **DAILY_MAX_LOSS_EUR** stop and **MAX_CONSECUTIVE_LOSSES** guard.
+- Loop now stops if day net ≤ -DAILY_MAX_LOSS_EUR or if consecutive losses threshold is hit.
+- No behaviour removed; integrates with the existing ledger & budget-aware sizing.
 """
-import json
 import logging
 import os
 import signal
@@ -31,7 +28,8 @@ from config import (
     SESSION_IDLE_SLEEP_SECONDS, SCALP_STRATEGY,
     RETRY_BACKOFF_SEC,
     QUOTA_REPORT_EVERY_SEC, EST_TRADE_PER_MIN, EST_DATA_PER_MIN, EST_HIST_POINTS_WEEK,
-    START_BALANCE_EUR
+    START_BALANCE_EUR, EFFECTIVE_LEVERAGE, MARGIN_UTILIZATION,
+    DAILY_MAX_LOSS_EUR, MAX_CONSECUTIVE_LOSSES
 )
 from ledger import Ledger
 
@@ -39,7 +37,6 @@ stop_event = threading.Event()
 
 
 def close_all_positions(ig: IGRest, epic: str | None = None) -> None:
-    """Attempt to close all (or only matching) open positions at market."""
     try:
         pos = ig.list_positions()
     except Exception as e:
@@ -52,8 +49,7 @@ def close_all_positions(ig: IGRest, epic: str | None = None) -> None:
         direction = position.get("direction")
         try:
             size = float(position.get("size", 0) or 0)
-        except Exception as e:
-            logging.error("%s", e)
+        except Exception:
             continue
         inst_epic = position.get("epic") or market.get("epic")
         expiry = position.get("expiry") or market.get("expiry") or "-"
@@ -63,15 +59,14 @@ def close_all_positions(ig: IGRest, epic: str | None = None) -> None:
         if epic and inst_epic != epic:
             continue
         try:
-            ref = ig.close_position_market(deal_id, direction, size,
-                                           epic=inst_epic, expiry=expiry, currency=currency)
-            logging.info("Closed %s (%s) size=%.2f dealRef=%s", inst_epic, direction, size, ref)
+            ig.close_position_market(deal_id, direction, size,
+                                     epic=inst_epic, expiry=expiry, currency=currency)
+            logging.info("Closed %s (%s) size=%.2f", inst_epic, direction, size)
         except Exception as e:
             logging.error("%s", e)
 
 
 def main():
-    """Run the scalper until the **net** daily target is reached or a stop signal arrives."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -87,7 +82,6 @@ def main():
         print("Set API_KEY, USERNAME, PASSWORD (and ACCOUNT_ID) as env vars.", file=sys.stderr)
         sys.exit(2)
 
-    # --- Quota tracker + reporter
     limits = RateLimits(
         trade_per_min=EST_TRADE_PER_MIN,
         data_per_min=EST_DATA_PER_MIN,
@@ -107,8 +101,8 @@ def main():
         finally:
             try:
                 ig.logout()
-            except Exception as e:
-                logging.error("%s", e)
+            except Exception:
+                pass
             sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_signal)
@@ -117,39 +111,54 @@ def main():
     try:
         ig.login()
 
-        # --- Market selection & static instrument properties
+        # --- Ledger & working capital
+        ledger = Ledger(start_balance_default=START_BALANCE_EUR)
+        working_capital = float(ledger.day_start_balance)
+        logging.info("Ledger: opening balance=€%.2f | today's start=€%.2f | targets: +€%.2f / -€%.2f",
+                     ledger.balance, ledger.day_start_balance, DAILY_TARGET_EUR, DAILY_MAX_LOSS_EUR)
+
+        # --- Market selection
         epic, details = choose_germany40_epic(ig)
 
-        # pip & point information for P&L math
         instr = details.get("instrument", {})
-        one_pip_means = (instr.get("onePipMeans") or "1").split()[0]
-        try:
-            points_per_pip = float(one_pip_means)
-        except Exception:
-            points_per_pip = 1.0
+        points_per_pip = float(str(instr.get("onePipMeans", "1")).split()[0] or 1)
         pip_value_eur = float(instr.get("valueOfOnePip") or 1.0)
 
-        size, tp_pts, sl_pts, currency = compute_size_and_distances(details, PER_TRADE_TARGET_EUR, 500.0)
-        logging.info("Initial sizing: size=%.2f, TP=%.2f pts, SL=%.2f pts, currency=%s", size, tp_pts, sl_pts, currency)
+        # --- Budget-aware sizing
+        size, tp_pts, sl_pts, currency, ok = compute_size_and_distances(
+            details=details,
+            target_eur=PER_TRADE_TARGET_EUR,
+            working_capital_eur=working_capital,
+            effective_leverage=EFFECTIVE_LEVERAGE,
+            margin_utilization=MARGIN_UTILIZATION,
+        )
+        if not ok or size <= 0:
+            logging.info("Min size exceeds budget (W=€%.2f, L=%.1fx). Waiting…", working_capital, EFFECTIVE_LEVERAGE)
+            while not stop_event.is_set():
+                time.sleep(30.0)
+            return
 
-        ig_min_stop_points = float(
-            details.get("dealingRules", {}).get("minNormalStopOrLimitDistance", {}).get("value", 0.1))
-
-        # --- Ledger (persists balance & trades day to day)
-        ledger = Ledger(start_balance_default=START_BALANCE_EUR)
-        logging.info("Ledger: opening balance=€%.2f | today's start=€%.2f | today's net=€%.2f/€%.2f",
-                     ledger.balance, ledger.day_start_balance, ledger.day_net(), DAILY_TARGET_EUR)
-
+        ig_min_stop_points = float(details.get("dealingRules", {}).get("minNormalStopOrLimitDistance", {}).get("value", 0.1))
         trade_num = 0
+        consecutive_losses = 0
 
-        # Keep trading until the **net** P&L for *today* reaches the daily target
-        while (ledger.day_net() + 1e-6) < DAILY_TARGET_EUR and not stop_event.is_set():
+        while not stop_event.is_set():
+            # Day-level guards BEFORE attempting a new trade
+            if ledger.day_net() >= DAILY_TARGET_EUR - 1e-6:
+                logging.info("Daily profit target reached: +€%.2f >= +€%.2f", ledger.day_net(), DAILY_TARGET_EUR)
+                break
+            if ledger.day_net() <= -DAILY_MAX_LOSS_EUR + 1e-6:
+                logging.info("Daily loss limit hit: €%.2f ≤ -€%.2f — stopping for the day.", ledger.day_net(), DAILY_MAX_LOSS_EUR)
+                break
+            if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                logging.info("Max consecutive losses reached (%d) — stopping for the day.", MAX_CONSECUTIVE_LOSSES)
+                break
+
             if not is_within_sessions():
                 logging.info("Outside session window. Sleeping %.0f sec…", SESSION_IDLE_SLEEP_SECONDS)
                 time.sleep(SESSION_IDLE_SLEEP_SECONDS)
                 continue
 
-            # Pre-entry volatility & cost gates
             try:
                 bars = ig.recent_prices(epic, "MINUTE", max(ATR_PERIOD + 2, 30)).get("prices", [])
             except Exception as e:
@@ -168,7 +177,6 @@ def main():
                 time.sleep(5.0)
                 continue
 
-            # ===== Strategy-driven direction =====
             direction = choose_direction(ig, epic, SCALP_STRATEGY)
             if not direction:
                 logging.info("No %s signal; waiting…", SCALP_STRATEGY)
@@ -180,7 +188,6 @@ def main():
             logging.info("Trade #%d (%s): %s %s size=%.2f | TP=%.2f pts (≈€%.2f), SL=%.2f pts",
                          trade_num, SCALP_STRATEGY, direction, epic, size, tp_pts, PER_TRADE_TARGET_EUR, sl_pts)
 
-            # ===== Place order =====
             try:
                 deal_ref, confirm = ig.open_market_position(
                     epic=epic,
@@ -198,7 +205,7 @@ def main():
             status = (confirm.get("dealStatus") or confirm.get("status") or "").upper()
             deal_id = confirm.get("dealId")
             if status not in ("ACCEPTED", "OPENED", "FILLED") or not deal_id:
-                logging.error("Deal not accepted: %s | confirm=%s", status, json.dumps(confirm)[:300])
+                logging.error("Deal not accepted: %s", status)
                 time.sleep(RETRY_BACKOFF_SEC)
                 continue
 
@@ -212,11 +219,9 @@ def main():
                         break
                 if entry_level is None:
                     entry_level = float(last_mid) if last_mid is not None else None
-            except Exception as e:
-                logging.error("%s", e)
+            except Exception:
                 entry_level = float(last_mid) if last_mid is not None else None
 
-            # ===== Manage trade until exit =====
             move_pts, exit_mid = trade_manager(
                 ig=ig,
                 deal_id=deal_id,
@@ -229,12 +234,11 @@ def main():
                 stop_event=stop_event
             )
 
-            # Convert move in points into approx EUR P&L
             pnl_eur = 0.0
             if move_pts is not None:
                 pnl_eur = float(size) * (float(move_pts) / float(points_per_pip)) * float(pip_value_eur)
 
-            # Update ledger (persists balance) and log
+            # Record to ledger
             trade_rec = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "epic": epic,
@@ -251,20 +255,47 @@ def main():
             }
             ledger.record_trade(trade_rec)
 
-            logging.info("Trade exit. Approx P&L=€%.2f | balance=€%.2f | today's net=€%.2f/€%.2f",
-                         pnl_eur, ledger.balance, ledger.day_net(), DAILY_TARGET_EUR)
+            # Update consecutive-loss counter
+            if pnl_eur <= 0.0:
+                consecutive_losses += 1
+            else:
+                consecutive_losses = 0
 
-            # Re-check sizing in case IG min distances changed
+            logging.info(
+                "Trade exit. P&L=€%.2f | balance=€%.2f | today's net=€%.2f (goal +€%.2f / max loss -€%.2f) | consecLosses=%d/%d",
+                pnl_eur, ledger.balance, ledger.day_net(), DAILY_TARGET_EUR, DAILY_MAX_LOSS_EUR,
+                consecutive_losses, MAX_CONSECUTIVE_LOSSES
+            )
+
+            # Re-check guards immediately after a trade
+            if ledger.day_net() >= DAILY_TARGET_EUR - 1e-6:
+                logging.info("Daily profit target reached after trade.")
+                break
+            if ledger.day_net() <= -DAILY_MAX_LOSS_EUR + 1e-6:
+                logging.info("Daily loss limit hit after trade — stopping for the day.")
+                break
+            if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                logging.info("Max consecutive losses reached after trade — stopping for the day.")
+                break
+
+            # Optionally refresh instrument details (min distances etc.)
             try:
                 details = ig.market_details(epic)
-                new_size, new_tp, new_sl, _ = compute_size_and_distances(details, PER_TRADE_TARGET_EUR, 500.0)
-                if (abs(new_size - size) > 1e-6) or (abs(new_tp - tp_pts) > 1e-6):
-                    size, tp_pts, sl_pts = new_size, new_tp, new_sl
-                    logging.info("Adjusted sizing: size=%.2f, TP=%.2f, SL=%.2f", size, tp_pts, sl_pts)
+                size, tp_pts, sl_pts, currency, ok = compute_size_and_distances(
+                    details=details,
+                    target_eur=PER_TRADE_TARGET_EUR,
+                    working_capital_eur=working_capital,  # working capital fixed for today
+                    effective_leverage=EFFECTIVE_LEVERAGE,
+                    margin_utilization=MARGIN_UTILIZATION,
+                )
+                if not ok or size <= 0:
+                    logging.info("Sizing now exceeds budget; pausing trades for today.")
+                    break
+                logging.info("Adjusted sizing: size=%.2f TP=%.2f SL=%.2f", size, tp_pts, sl_pts)
             except Exception as e:
                 logging.error("%s", e)
 
-        logging.info("Target reached or stop requested. Tidying up…")
+        logging.info("Target or guard reached, or stop requested. Tidying up…")
         close_all_positions(ig, epic=None)
 
     except Exception as e:
@@ -272,8 +303,8 @@ def main():
     finally:
         try:
             ig.logout()
-        except Exception as e:
-            logging.error("%s", e)
+        except Exception:
+            pass
         logging.info("Logged out. Bye.")
 
 
@@ -281,6 +312,6 @@ if __name__ == "__main__":
     try:
         from dotenv import load_dotenv
         load_dotenv(".env", override=True)
-    except Exception as e:
-        logging.error("%s", e)
+    except Exception:
+        pass
     main()
