@@ -2,18 +2,13 @@
 """
 main.py — IG REST DAX scalper (DEMO), modular + quota reporting.
 
-Adds periodic quota/call-usage reporting:
-- Rolling 60s windows for trade/data/auth/other
-- Rolling 7-day historical datapoint usage (candles fetched)
-- Surfaces any X-RateLimit-* headers if IG sends them
+Change summary for this version:
+- Daily goal is **net** of wins and losses. We keep trading until today's P&L >= DAILY_TARGET_EUR.
+- Added a simple local ledger (CSV + state.json) that persists trades and rolling balance across days.
+  Balance carries over: today's start = yesterday's end.
 
-Aim & goal unchanged:
-- Per-trade TP ≈ €1; Daily ≈ €10
-- SL distance = 3× TP (>= IG min)
-- ATR/spread gates; EMA(20) invalidation; breakeven + ATR trailing
-- Session filter Europe/Berlin
+Other behaviour unchanged (session filter, ATR/spread gates, trailing, etc.).
 """
-
 import json
 import logging
 import os
@@ -21,6 +16,7 @@ import signal
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 
 from ig_client import IGRest
 from sizing import choose_germany40_epic, compute_size_and_distances
@@ -34,8 +30,10 @@ from config import (
     ATR_PERIOD, ATR_MIN_THRESHOLD, SPREAD_MAX_POINTS,
     SESSION_IDLE_SLEEP_SECONDS, SCALP_STRATEGY,
     RETRY_BACKOFF_SEC,
-    QUOTA_REPORT_EVERY_SEC, EST_TRADE_PER_MIN, EST_DATA_PER_MIN, EST_HIST_POINTS_WEEK
+    QUOTA_REPORT_EVERY_SEC, EST_TRADE_PER_MIN, EST_DATA_PER_MIN, EST_HIST_POINTS_WEEK,
+    START_BALANCE_EUR
 )
+from ledger import Ledger
 
 stop_event = threading.Event()
 
@@ -73,7 +71,7 @@ def close_all_positions(ig: IGRest, epic: str | None = None) -> None:
 
 
 def main():
-    """Run the demo scalper until target is reached or a stop signal arrives."""
+    """Run the scalper until the **net** daily target is reached or a stop signal arrives."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -119,7 +117,17 @@ def main():
     try:
         ig.login()
 
+        # --- Market selection & static instrument properties
         epic, details = choose_germany40_epic(ig)
+
+        # pip & point information for P&L math
+        instr = details.get("instrument", {})
+        one_pip_means = (instr.get("onePipMeans") or "1").split()[0]
+        try:
+            points_per_pip = float(one_pip_means)
+        except Exception:
+            points_per_pip = 1.0
+        pip_value_eur = float(instr.get("valueOfOnePip") or 1.0)
 
         size, tp_pts, sl_pts, currency = compute_size_and_distances(details, PER_TRADE_TARGET_EUR, 500.0)
         logging.info("Initial sizing: size=%.2f, TP=%.2f pts, SL=%.2f pts, currency=%s", size, tp_pts, sl_pts, currency)
@@ -127,10 +135,15 @@ def main():
         ig_min_stop_points = float(
             details.get("dealingRules", {}).get("minNormalStopOrLimitDistance", {}).get("value", 0.1))
 
-        realized_approx = 0.0
+        # --- Ledger (persists balance & trades day to day)
+        ledger = Ledger(start_balance_default=START_BALANCE_EUR)
+        logging.info("Ledger: opening balance=€%.2f | today's start=€%.2f | today's net=€%.2f/€%.2f",
+                     ledger.balance, ledger.day_start_balance, ledger.day_net(), DAILY_TARGET_EUR)
+
         trade_num = 0
 
-        while (realized_approx + 1e-6) < DAILY_TARGET_EUR and not stop_event.is_set():
+        # Keep trading until the **net** P&L for *today* reaches the daily target
+        while (ledger.day_net() + 1e-6) < DAILY_TARGET_EUR and not stop_event.is_set():
             if not is_within_sessions():
                 logging.info("Outside session window. Sleeping %.0f sec…", SESSION_IDLE_SLEEP_SECONDS)
                 time.sleep(SESSION_IDLE_SLEEP_SECONDS)
@@ -204,7 +217,7 @@ def main():
                 entry_level = float(last_mid) if last_mid is not None else None
 
             # ===== Manage trade until exit =====
-            favourable = trade_manager(
+            move_pts, exit_mid = trade_manager(
                 ig=ig,
                 deal_id=deal_id,
                 epic=epic,
@@ -216,12 +229,30 @@ def main():
                 stop_event=stop_event
             )
 
-            if favourable:
-                realized_approx += PER_TRADE_TARGET_EUR
-                logging.info("Favourable exit. Session realized ≈ €%.2f / €%.2f target",
-                             realized_approx, DAILY_TARGET_EUR)
-            else:
-                logging.info("Unfavourable/neutral exit not adding to €1-per-trade goal.")
+            # Convert move in points into approx EUR P&L
+            pnl_eur = 0.0
+            if move_pts is not None:
+                pnl_eur = float(size) * (float(move_pts) / float(points_per_pip)) * float(pip_value_eur)
+
+            # Update ledger (persists balance) and log
+            trade_rec = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "epic": epic,
+                "direction": direction,
+                "size": float(size),
+                "currency": currency,
+                "entry_level": float(entry_level) if entry_level is not None else None,
+                "exit_level": float(exit_mid) if exit_mid is not None else None,
+                "move_points": float(move_pts) if move_pts is not None else None,
+                "tp_points": float(tp_pts),
+                "sl_points": float(sl_pts),
+                "pnl_eur": float(pnl_eur),
+                "notes": "auto"
+            }
+            ledger.record_trade(trade_rec)
+
+            logging.info("Trade exit. Approx P&L=€%.2f | balance=€%.2f | today's net=€%.2f/€%.2f",
+                         pnl_eur, ledger.balance, ledger.day_net(), DAILY_TARGET_EUR)
 
             # Re-check sizing in case IG min distances changed
             try:

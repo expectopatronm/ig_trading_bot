@@ -4,7 +4,6 @@ config.py — Centralized constants & tunables.
 All values can be overridden via environment variables where it makes sense.
 This keeps 'what rarely changes' in one place, away from main.py.
 """
-
 import os
 from typing import List, Tuple
 
@@ -12,6 +11,13 @@ from typing import List, Tuple
 PER_TRADE_TARGET_EUR: float = float(os.environ.get("PER_TRADE_TARGET_EUR", "1.0"))
 DAILY_TARGET_EUR: float = float(os.environ.get("DAILY_TARGET_EUR", "10.0"))
 STOP_TO_LIMIT_MULTIPLIER: float = float(os.environ.get("STOP_TO_LIMIT_MULTIPLIER", "3.0"))
+
+# ===== Ledger / balance =====
+# Starting balance used to initialise the ledger the very first time only.
+START_BALANCE_EUR: float = float(os.environ.get("START_BALANCE_EUR", "500.0"))
+LEDGER_DIR: str = os.environ.get("LEDGER_DIR", "ledger")
+LEDGER_TRADES_CSV: str = os.environ.get("LEDGER_TRADES_CSV", os.path.join(LEDGER_DIR, "trades.csv"))
+LEDGER_STATE_JSON: str = os.environ.get("LEDGER_STATE_JSON", os.path.join(LEDGER_DIR, "state.json"))
 
 # ===== Entry filters / management =====
 EMA_PERIOD: int = int(os.environ.get("EMA_PERIOD", "20"))
@@ -68,10 +74,6 @@ EST_DATA_PER_MIN: int = int(os.environ.get("EST_DATA_PER_MIN", "120"))
 EST_HIST_POINTS_WEEK: int = int(os.environ.get("EST_HIST_POINTS_WEEK", "10000"))
 
 # ===== Historical usage protection & price caching =====
-# Enable a lightweight per-(epic,resolution) price cache that avoids calling /prices
-# more than once per bar period (e.g., once per minute for MINUTE bars).
 PRICE_CACHE_ENABLED: bool = os.environ.get("PRICE_CACHE_ENABLED", "true").lower() == "true"
-# Optional: allow using cached bars even if they are a few minutes old when the weekly allowance is low
 PRICE_CACHE_STALE_SEC: float = float(os.environ.get("PRICE_CACHE_STALE_SEC", "300"))
-# Keep a reserve so we don't hard-stop at zero (helps prevent 403s mid-session)
 HIST_RESERVE_POINTS: int = int(os.environ.get("HIST_RESERVE_POINTS", "2000"))

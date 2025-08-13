@@ -1,12 +1,14 @@
 """
 risk.py — Trade management: breakeven move + ATR trailing, EMA invalidation, spread/ATR gates.
-Stable logic shared by all strategies.
-"""
 
+UPDATED:
+- Returns an approximate move in *points* and an approximate exit price instead of a True/False flag.
+  Positive move = favourable, negative move = loss. Caller converts this to EUR using instrument pip info.
+"""
 import logging
 import math
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Tuple, Optional
 
 from config import (
     POLL_POSITIONS_SEC, ATR_PERIOD, EMA_PERIOD, ATR_MIN_THRESHOLD, SPREAD_MAX_POINTS,
@@ -18,16 +20,17 @@ from indicators import compute_atr_points, ema_of_closes, latest_mid_and_spread
 
 def trade_manager(ig, deal_id: str, epic: str, currency: str, is_long: bool,
                   entry_level: float, tp_pts: float, ig_min_stop_points: float,
-                  stop_event) -> bool:
+                  stop_event) -> Tuple[Optional[float], Optional[float]]:
     """
-    Manage an open trade until it closes. Returns True if exit likely >= ~€1, else False.
+    Manage an open trade until it closes.
+    Returns (approx_move_points, approx_exit_mid).
 
+    Notes:
     - After +50% of TP distance, move stop to tiny positive breakeven and enable ATR-trailing.
     - Exit early on EMA(20) invalidation or if ATR/spread gates deteriorate.
     - Polls until position disappears.
     """
     trailing_activated = False
-    approx_favourable = False
 
     while not stop_event.is_set():
         try:
@@ -43,17 +46,19 @@ def trade_manager(ig, deal_id: str, epic: str, currency: str, is_long: bool,
                 pos_row = p
                 break
         if pos_row is None:
+            # Position has disappeared (hit TP/SL or was closed by our earlier request).
             try:
                 bars = ig.recent_prices(epic, "MINUTE", 2).get("prices", [])
                 last_mid, _ = latest_mid_and_spread(bars)
-                if last_mid is not None:
-                    move_pts = (last_mid - entry_level) if is_long else (entry_level - last_mid)
-                    if move_pts >= (tp_pts * 0.8) or trailing_activated:
-                        approx_favourable = True
+                if last_mid is None:
+                    return None, None
+                move_pts = (last_mid - entry_level) if is_long else (entry_level - last_mid)
+                return float(move_pts), float(last_mid)
             except Exception as e:
                 logging.error("%s", e)
-            return approx_favourable
+                return None, None
 
+        # We still have an open position — analyse current context
         try:
             bars = ig.recent_prices(epic, "MINUTE", max(ATR_PERIOD + 2, 30)).get("prices", [])
         except Exception as e:
@@ -74,6 +79,7 @@ def trade_manager(ig, deal_id: str, epic: str, currency: str, is_long: bool,
 
         move_pts = (last_mid - entry_level) if is_long else (entry_level - last_mid)
 
+        # Breakeven + ATR trailing after partial progress
         if (not trailing_activated) and move_pts >= (tp_pts * BREAKEVEN_TRIGGER_RATIO):
             trail_dist = max(atr * TRAIL_DIST_ATR_MULT, ig_min_stop_points)
             trail_step = max(atr * TRAIL_STEP_ATR_MULT, MIN_TRAIL_STEP_POINTS)
@@ -87,13 +93,12 @@ def trade_manager(ig, deal_id: str, epic: str, currency: str, is_long: bool,
                     stop_level=round(breakeven, 2)
                 )
                 trailing_activated = True
-                approx_favourable = True
                 logging.info("Trailing activated: dist=%.2f, step=%.2f, stopLevel≈%.2f",
                              trail_dist, trail_step, breakeven)
             except Exception as e:
                 logging.error("%s", e)
 
-        # EMA invalidation
+        # EMA invalidation close
         if (is_long and last_mid < ema20) or ((not is_long) and last_mid > ema20):
             try:
                 position = pos_row["position"]; market = pos_row.get("market", {})
@@ -105,9 +110,10 @@ def trade_manager(ig, deal_id: str, epic: str, currency: str, is_long: bool,
                 )
             except Exception as e:
                 logging.error("%s", e)
-            return approx_favourable
+            # Return the move at the time we gave the close instruction
+            return float(move_pts), float(last_mid)
 
-        # Vol/spread deterioration
+        # Vol/spread deterioration close
         if (atr < ATR_MIN_THRESHOLD) or (spread is not None and spread > SPREAD_MAX_POINTS):
             try:
                 position = pos_row["position"]; market = pos_row.get("market", {})
@@ -119,6 +125,6 @@ def trade_manager(ig, deal_id: str, epic: str, currency: str, is_long: bool,
                 )
             except Exception as e:
                 logging.error("%s", e)
-            return approx_favourable
+            return float(move_pts), float(last_mid)
 
         time.sleep(POLL_POSITIONS_SEC)
